@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Image Studio – Flask + Diffusers</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+        rel="stylesheet"
+    >
+
+    <!-- Icons -->
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+    >
+
+    <!-- App styles -->
+    <link
+        rel="stylesheet"
+        href="{{ url_for('static', filename='css/style.css') }}"
+    >
+</head>
+<body>
+<div class="shell">
+    <div class="app-card">
+
+        <header class="app-header">
+            <div class="app-title-block">
+                <h1>
+                    <span>Image Studio</span>
+                    <span class="app-pill">
+                        <i class="fa-solid fa-bolt-lightning"></i>
+                        Flask · Diffusers
+                    </span>
+                </h1>
+                <p>
+                    Local image generation with Hugging Face models, GPU monitoring and multi-model support.
+                </p>
+            </div>
+            <div class="gpu-badge">
+                <span class="gpu-dot"></span>
+                <span>Local GPU online</span>
+            </div>
+        </header>
+
+        {% if error_message %}
+            <div class="badge-err">
+                <i class="fa-solid fa-circle-exclamation"></i>
+                <span>{{ error_message }}</span>
+            </div>
+        {% endif %}
+
+        <div class="stats-card">
+            <div class="stats-header">
+                <div class="stats-header-title">System stats</div>
+            </div>
+            <div id="system-stats" class="stats-body">
+                Loading system stats...
+            </div>
+        </div>
+
+        <div class="layout">
+            <!-- Left: control panel -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div>
+                        <div class="panel-title">Generation controls</div>
+                        <div class="panel-subtitle">Choose model, prompt and sampling settings.</div>
+                    </div>
+                </div>
+
+                <form method="post" action="{{ url_for('generate') }}">
+                    <div class="form-grid">
+
+                        <div>
+                            <label class="form-label" for="model_name">Model</label>
+                            <select id="model_name" name="model_name" class="select">
+                                {% for m in models %}
+                                <option value="{{ m }}" {% if m == selected_model %}selected{% endif %}>
+                                    {{ m }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="form-label" for="custom_model_repo">
+                                Add model (Hugging Face URL or repo_id)
+                            </label>
+                            <input
+                                type="text"
+                                id="custom_model_repo"
+                                name="custom_model_repo"
+                                class="input"
+                                placeholder="e.g. https://huggingface.co/author/model or author/model"
+                                value="{{ custom_model_repo }}"
+                            >
+                            <div class="helper-text">
+                                If filled, it will register and use this model for the next generation.
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="form-label" for="prompt">Prompt</label>
+                            <textarea
+                                id="prompt"
+                                name="prompt"
+                                class="textarea"
+                                rows="3"
+                                placeholder="Describe what you want to see..."
+                                required
+                            >{{ last_prompt }}</textarea>
+                        </div>
+
+                        <div class="form-row">
+                            <div>
+                                <label class="form-label" for="steps">Steps</label>
+                                <input
+                                    type="number"
+                                    class="input"
+                                    id="steps"
+                                    name="steps"
+                                    min="1"
+                                    max="50"
+                                    step="1"
+                                    value="{{ last_steps }}"
+                                >
+                            </div>
+                            <div>
+                                <label class="form-label" for="height">Height</label>
+                                <input
+                                    type="number"
+                                    class="input"
+                                    id="height"
+                                    name="height"
+                                    min="128"
+                                    max="2048"
+                                    step="64"
+                                    value="{{ last_height }}"
+                                >
+                            </div>
+                            <div>
+                                <label class="form-label" for="width">Width</label>
+                                <input
+                                    type="number"
+                                    class="input"
+                                    id="width"
+                                    name="width"
+                                    min="128"
+                                    max="2048"
+                                    step="64"
+                                    value="{{ last_width }}"
+                                >
+                            </div>
+                            <div>
+                                <label class="form-label" for="num_images">Images</label>
+                                <input
+                                    type="number"
+                                    class="input"
+                                    id="num_images"
+                                    name="num_images"
+                                    min="1"
+                                    max="8"
+                                    step="1"
+                                    value="{{ last_num_images }}"
+                                >
+                            </div>
+                        </div>
+
+                        <div style="display:flex;justify-content:flex-end;margin-top:4px;">
+                            <button type="submit" class="btn-primary">
+                                <i class="fa-solid fa-wand-magic-sparkles"></i>
+                                <span>Generate</span>
+                            </button>
+                        </div>
+
+                    </div>
+                </form>
+            </div>
+
+            <!-- Right: gallery -->
+            <div class="gallery-panel">
+                <div class="gallery-header">
+                    <div>
+                        <div class="gallery-title">Recent outputs</div>
+                        <div class="gallery-subtitle">
+                            Your generated images appear here. Hover for actions.
+                        </div>
+                    </div>
+                </div>
+
+                {% if images and images|length > 0 %}
+                    <div class="gallery-grid">
+                        {% for img in images %}
+                            <div class="image-card">
+                                <div class="image-wrapper">
+                                    <img src="{{ img.url }}" alt="Generated image">
+                                    <div class="image-overlay"></div>
+
+                                    <div class="image-actions">
+                                        <!-- Refresh/regenerate -->
+                                        <form
+                                            method="post"
+                                            action="{{ url_for('generate') }}"
+                                            style="margin:0;"
+                                        >
+                                            <input type="hidden" name="model_name" value="{{ img.model_name }}">
+                                            <input type="hidden" name="custom_model_repo" value="">
+                                            <input type="hidden" name="prompt" value="{{ img.prompt }}">
+                                            <input type="hidden" name="steps" value="{{ img.steps }}">
+                                            <input type="hidden" name="height" value="{{ img.height }}">
+                                            <input type="hidden" name="width" value="{{ img.width }}">
+                                            <input type="hidden" name="num_images" value="1">
+                                            <button
+                                                type="submit"
+                                                class="icon-button"
+                                                title="Regenerate"
+                                            >
+                                                <i class="fa-solid fa-rotate-right"></i>
+                                            </button>
+                                        </form>
+
+                                        <!-- Open in new tab -->
+                                        <a
+                                            href="{{ img.url }}"
+                                            target="_blank"
+                                            class="icon-link"
+                                            title="Open in new tab"
+                                        >
+                                            <i class="fa-solid fa-up-right-from-square"></i>
+                                        </a>
+
+                                        <!-- Download -->
+                                        <a
+                                            href="{{ img.download_url }}"
+                                            class="icon-link"
+                                            title="Download"
+                                        >
+                                            <i class="fa-solid fa-download"></i>
+                                        </a>
+                                    </div>
+                                </div>
+
+                                <div class="image-info">
+                                    <div class="image-meta-top">
+                                        <span class="model-chip">{{ img.model_name }}</span>
+                                        <span class="image-meta-detail">
+                                            {{ img.width }}×{{ img.height }} · {{ img.steps }} steps
+                                        </span>
+                                    </div>
+                                    <div class="prompt-snippet">
+                                        <span class="label">Prompt</span>
+                                        {{ img.prompt }}
+                                    </div>
+                                </div>
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <div class="empty-state">
+                        <i class="fa-regular fa-image" style="margin-bottom:6px;"></i><br>
+                        No images yet. Enter a prompt on the left and press <strong>Generate</strong>.
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Loading overlay -->
+<div id="loading-overlay" class="loading-overlay">
+    <div class="loading-inner">
+        <div class="spinner"></div>
+        <div class="loading-text-main">Generating images…</div>
+        <div class="loading-text-sub">This may take a few seconds, especially while loading the model.</div>
+    </div>
+</div>
+
+<!-- App JS -->
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
