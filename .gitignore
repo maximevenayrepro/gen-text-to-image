@@ -6,3 +6,5 @@
 /static/generated
 /config.json
 .cursor/debug.log
+debug.log
+*.log
