@@ -43,6 +43,13 @@
                     Local image generation with Hugging Face models, GPU monitoring and multi-model support.
                 </p>
             </div>
+            <div style="margin-top: 12px;">
+                <button type="button" id="hf-token-btn" class="icon-button-small" title="Configure Hugging Face Token" style="width: auto; padding: 0 10px; gap: 6px;">
+                    <i class="fa-solid fa-key"></i>
+                    <span>Token</span>
+                    <i id="hf-token-status-icon" class="fa-solid" style="margin-left: 6px;"></i>
+                </button>
+            </div>
         </header>
 
         {% if error_message %}
@@ -67,6 +74,21 @@
                         <div class="stats-metric-label">RAM</div>
                         <div class="stats-metric-value" id="ram-value">--</div>
                         <canvas id="ram-chart"></canvas>
+                    </div>
+                    <div class="stats-metric-item">
+                        <div class="stats-metric-label">GPU</div>
+                        <div class="stats-metric-value" id="gpu-value">--</div>
+                        <canvas id="gpu-chart"></canvas>
+                    </div>
+                    <div class="stats-metric-item">
+                        <div class="stats-metric-label">GPU Memory</div>
+                        <div class="stats-metric-value" id="gpu-mem-value">--</div>
+                        <canvas id="gpu-mem-chart"></canvas>
+                    </div>
+                    <div class="stats-metric-item">
+                        <div class="stats-metric-label">GPU Shared Memory</div>
+                        <div class="stats-metric-value" id="gpu-shared-mem-value">--</div>
+                        <canvas id="gpu-shared-mem-chart"></canvas>
                     </div>
                 </div>
             </div>
@@ -302,6 +324,39 @@
         <div class="modal-footer">
             <button type="button" class="btn-secondary" id="modal-cancel-btn">Cancel</button>
             <button type="button" class="btn-primary" id="modal-ok-btn">OK</button>
+        </div>
+    </div>
+</div>
+
+<!-- Hugging Face Token Modal -->
+<div id="hf-token-modal" class="modal-overlay" style="display: none;">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Hugging Face Token</h3>
+            <button type="button" class="modal-close" id="hf-token-modal-close-btn">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+        </div>
+        <div class="modal-body">
+            <label class="form-label" for="hf-token-input">
+                Hugging Face Access Token
+            </label>
+            <input
+                type="password"
+                id="hf-token-input"
+                class="input"
+                placeholder="hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            >
+            <div class="helper-text">
+                Required for accessing gated models (e.g., Stable Diffusion 3.5 Large).
+                <br>
+                Get your token at: <a href="https://huggingface.co/settings/tokens" target="_blank" style="color: #60a5fa;">https://huggingface.co/settings/tokens</a>
+            </div>
+            <div id="hf-token-status" style="margin-top: 8px; font-size: 12px; color: #9ca3af;"></div>
+        </div>
+        <div class="modal-footer">
+            <button type="button" class="btn-secondary" id="hf-token-modal-cancel-btn">Cancel</button>
+            <button type="button" class="btn-primary" id="hf-token-modal-ok-btn">Save</button>
         </div>
     </div>
 </div>

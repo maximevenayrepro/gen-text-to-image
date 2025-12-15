@@ -45,7 +45,9 @@ python -m pip install ^
   pillow ^
   numpy ^
   requests ^
-  safetensors
+  safetensors ^
+  protobuf ^
+  sentencepiece
 
 REM ================================================================
 REM 6) Install diffusers from GitHub (for ZImagePipeline)

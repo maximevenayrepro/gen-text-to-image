@@ -4,3 +4,4 @@
 /runapp2.bat
 /.venv
 /static/generated
+/config.json

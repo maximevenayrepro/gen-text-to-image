@@ -1,8 +1,9 @@
 import os
 import uuid
 import time
+import json
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from flask import (
     Flask,
@@ -17,7 +18,7 @@ import base64
 from io import BytesIO
 import torch
 from huggingface_hub import snapshot_download
-from diffusers import DiffusionPipeline, ZImagePipeline
+from diffusers import DiffusionPipeline, ZImagePipeline, StableDiffusion3Pipeline
 import psutil
 import pynvml
 
@@ -35,6 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 IMAGES_DIR = BASE_DIR / "static" / "generated"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = BASE_DIR / "config.json"
 
 # Known models configuration
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -69,18 +71,96 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "default_steps": 8,
         "default_height": 512,
         "default_width": 512,
+    },
+    "stable-diffusion-3.5-large": {
+        "repo_id": "stabilityai/stable-diffusion-3.5-large",
+        "local_dir": MODELS_DIR / "stable-diffusion-3.5-large",
+        "pipeline_type": "sd3",
+        "default_steps": 28,
+        "default_height": 1024,
+        "default_width": 1024,
     }
 }
 
 DEFAULT_MODEL_NAME = "SDXL"
 
 # Global pipeline state (simple cache)
-pipe: DiffusionPipeline | ZImagePipeline | None = None
+pipe: DiffusionPipeline | ZImagePipeline | StableDiffusion3Pipeline | None = None
 current_model_name: str | None = None
 
 # In-memory cache for generated images (base64)
 # Key: image_id, Value: dict with base64 and metadata
 image_cache: Dict[str, Dict[str, Any]] = {}
+
+
+# ---------------------------
+# Token management
+# ---------------------------
+
+def load_hf_token() -> Optional[str]:
+    """
+    Load Hugging Face token from config.json file.
+    Returns the token string or None if not found.
+    """
+    if not CONFIG_FILE.exists():
+        return None
+    
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            return config.get("hf_token")
+    except (json.JSONDecodeError, KeyError, IOError) as e:
+        print(f"Error loading token from config.json: {e}")
+        return None
+
+
+def save_hf_token(token: str) -> bool:
+    """
+    Save Hugging Face token to config.json file.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        config = {}
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                config = {}
+        
+        config["hf_token"] = token
+        
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        
+        # Set environment variable for Hugging Face Hub
+        os.environ["HF_TOKEN"] = token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+        
+        return True
+    except IOError as e:
+        print(f"Error saving token to config.json: {e}")
+        return False
+
+
+def get_hf_token() -> Optional[str]:
+    """
+    Get Hugging Face token from environment variable or config file.
+    Returns the token string or None if not found.
+    """
+    # First check environment variable
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+    
+    # Then check config file
+    token = load_hf_token()
+    if token:
+        # Set environment variable for future use
+        os.environ["HF_TOKEN"] = token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+    
+    return token
 
 
 # ---------------------------
@@ -101,12 +181,17 @@ def ensure_model_downloaded(repo_id: str, model_dir: Path) -> Path:
     print(f"Local model not found for repo {repo_id}. Downloading to: {model_dir}")
 
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    
+    # Get token for authentication
+    token = get_hf_token()
+    token_kwargs = {"token": token} if token else {}
 
     snapshot_download(
         repo_id=repo_id,
         local_dir=str(model_dir),
         local_dir_use_symlinks=False,
         resume_download=True,
+        **token_kwargs,
     )
 
     print(f"Download finished. Model stored at: {model_dir}")
@@ -275,14 +360,28 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
     print(f"Loading pipeline for model '{model_name}' from {model_path}")
 
     try:
-        # Logic: only models explicitly marked "z_image"
-        # will use ZImagePipeline. All others use DiffusionPipeline.
-        if config.get("pipeline_type", "") == "z_image":
+        # Get token for authentication (needed for gated models)
+        token = get_hf_token()
+        token_kwargs = {"token": token} if token else {}
+        
+        # Logic: use specific pipeline types based on model configuration
+        pipeline_type = config.get("pipeline_type", "")
+        if pipeline_type == "z_image":
             new_pipe = ZImagePipeline.from_pretrained(
                 model_path,
                 torch_dtype=torch.bfloat16,
                 local_files_only=True,
                 low_cpu_mem_usage=True,
+                **token_kwargs,
+            )
+            new_pipe.to("cuda")
+        elif pipeline_type == "sd3":
+            new_pipe = StableDiffusion3Pipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+                **token_kwargs,
             )
             new_pipe.to("cuda")
         else:
@@ -292,6 +391,7 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
                 local_files_only=True,
                 low_cpu_mem_usage=True,
                 device_map="cuda",
+                **token_kwargs,
             )
 
         # Check for transformer component
@@ -369,6 +469,132 @@ def init_gpu_monitor():
         print(f"NVML init error: {e}")
 
 
+def get_gpu_shared_memory():
+    """
+    Get GPU shared memory (system RAM used by GPU) on Windows using Python only.
+    Uses ctypes to access Windows PDH API for performance counters.
+    Returns dict with shared_mem_used_GB and shared_mem_total_GB.
+    """
+    try:
+        import platform
+        if platform.system() != "Windows":
+            return None
+        
+        import ctypes
+        from ctypes import wintypes
+        
+        # Use PDH (Performance Data Helper) API to get shared memory usage
+        pdh = ctypes.windll.pdh
+        PDH_FMT_DOUBLE = 0x00000200
+        
+        shared_used_bytes = 0.0
+        
+        # Try to enumerate GPU Engine instances and get shared usage
+        try:
+            # First, get the size needed for the buffer
+            instance_buffer_size = ctypes.c_ulong(0)
+            counter_buffer_size = ctypes.c_ulong(0)
+            
+            pdh.PdhEnumObjectItemsW(
+                None, None, "GPU Engine",
+                None, ctypes.byref(instance_buffer_size),
+                None, ctypes.byref(counter_buffer_size),
+                ctypes.wintypes.DWORD(0x00000002 | 0x00000001), 0
+            )
+            
+            if instance_buffer_size.value > 0:
+                # Allocate buffers
+                instance_buffer = (ctypes.c_wchar * instance_buffer_size.value)()
+                counter_buffer = (ctypes.c_wchar * counter_buffer_size.value)()
+                instance_size = ctypes.c_ulong(instance_buffer_size.value)
+                counter_size = ctypes.c_ulong(counter_buffer_size.value)
+                
+                if pdh.PdhEnumObjectItemsW(
+                    None, None, "GPU Engine",
+                    instance_buffer, ctypes.byref(instance_size),
+                    counter_buffer, ctypes.byref(counter_size),
+                    ctypes.wintypes.DWORD(0x00000002 | 0x00000001), 0
+                ) == 0:
+                    # Parse instances
+                    instances_str = instance_buffer.value
+                    if instances_str:
+                        instances = [i for i in instances_str.split('\0') if i and 'engtype' in i]
+                        
+                        # Query each instance for shared usage
+                        for instance in instances:
+                            counter_path = f"\\GPU Engine({instance})\\Shared Usage"
+                            try:
+                                hQuery = wintypes.HANDLE()
+                                if pdh.PdhOpenQueryW(None, 0, ctypes.byref(hQuery)) == 0:
+                                    hCounter = wintypes.HANDLE()
+                                    path_bytes = counter_path.encode('utf-16le')
+                                    if pdh.PdhAddCounterW(hQuery, path_bytes, 0, ctypes.byref(hCounter)) == 0:
+                                        # Collect data (PDH requires two samples)
+                                        pdh.PdhCollectQueryData(hQuery)
+                                        time.sleep(0.1)
+                                        pdh.PdhCollectQueryData(hQuery)
+                                        
+                                        # Get formatted value
+                                        fmtValue = ctypes.c_double()
+                                        if pdh.PdhGetFormattedCounterValue(hCounter, PDH_FMT_DOUBLE, None, ctypes.byref(fmtValue)) == 0:
+                                            if fmtValue.value > 0:
+                                                shared_used_bytes += fmtValue.value
+                                        
+                                        pdh.PdhRemoveCounter(hCounter)
+                                    pdh.PdhCloseQuery(hQuery)
+                            except Exception:
+                                continue
+        except Exception as e:
+            print(f"Error enumerating GPU counters: {e}")
+        
+        # Get total shared memory - estimate from system RAM
+        # Windows typically allows up to 50% of system RAM for shared GPU memory
+        # But we try to get actual value if possible
+        ram = psutil.virtual_memory()
+        # Default: half of system RAM (Windows standard)
+        shared_total_bytes = ram.total // 2
+        
+        # Try to get more accurate value from registry (NVIDIA specific)
+        try:
+            import winreg
+            try:
+                # Try NVIDIA registry path
+                key = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
+                )
+                try:
+                    # SharedSystemMemory might be stored here
+                    value, _ = winreg.QueryValueEx(key, "SharedSystemMemory")
+                    if value and value > 0:
+                        shared_total_bytes = value
+                except FileNotFoundError:
+                    pass
+                finally:
+                    winreg.CloseKey(key)
+            except Exception:
+                pass
+        except ImportError:
+            pass
+        
+        if shared_total_bytes > 0:
+            shared_used_gb = round(shared_used_bytes / (1024 ** 3), 2)
+            shared_total_gb = round(shared_total_bytes / (1024 ** 3), 2)
+            shared_percent = round(shared_used_gb / shared_total_gb * 100, 1) if shared_total_gb > 0 else 0.0
+            
+            return {
+                "shared_mem_used_GB": shared_used_gb,
+                "shared_mem_total_GB": shared_total_gb,
+                "shared_mem_percent": shared_percent
+            }
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error getting GPU shared memory: {e}")
+        return None
+
+
 def get_gpu_stats():
     """
     Return a list of GPU stats dictionaries using NVML.
@@ -379,6 +605,9 @@ def get_gpu_stats():
         device_count = pynvml.nvmlDeviceGetCount()
     except pynvml.NVMLError:
         return []
+
+    # Get shared memory info (same for all GPUs typically)
+    shared_mem_info = get_gpu_shared_memory()
 
     gpus = []
     for i in range(device_count):
@@ -395,19 +624,23 @@ def get_gpu_stats():
         except pynvml.NVMLError:
             temp = None
 
-        gpus.append(
-            {
-                "index": i,
-                "name": name,
-                "gpu_util_percent": util.gpu,
-                "mem_used_MB": round(mem_info.used / (1024 ** 2), 1),
-                "mem_total_MB": round(mem_info.total / (1024 ** 2), 1),
-                "mem_util_percent": round(mem_info.used / mem_info.total * 100, 1)
-                if mem_info.total > 0
-                else 0.0,
-                "temperature_C": temp,
-            }
-        )
+        gpu_dict = {
+            "index": i,
+            "name": name,
+            "gpu_util_percent": util.gpu,
+            "mem_used_MB": round(mem_info.used / (1024 ** 2), 1),
+            "mem_total_MB": round(mem_info.total / (1024 ** 2), 1),
+            "mem_util_percent": round(mem_info.used / mem_info.total * 100, 1)
+            if mem_info.total > 0
+            else 0.0,
+            "temperature_C": temp,
+        }
+        
+        # Add shared memory info if available
+        if shared_mem_info:
+            gpu_dict.update(shared_mem_info)
+        
+        gpus.append(gpu_dict)
     return gpus
 
 def get_cpu_ram_stats():
@@ -585,12 +818,18 @@ def generate_images(
         generator = torch.Generator("cuda").manual_seed(image_seed)
 
         # Determine guidance scale based on model type
-        # Turbo models use 0.0, regular models use 7.5-9.0
+        # Turbo models use 0.0, SD3 models use 3.5, regular models use 7.5-9.0
         config = MODEL_CONFIGS.get(model_name, {})
+        pipeline_type = config.get("pipeline_type", "")
         repo_id = config.get("repo_id", "").lower()
         is_turbo = "turbo" in model_name.lower() or "turbo" in repo_id
         
-        guidance_scale = 0.0 if is_turbo else 7.5
+        if is_turbo:
+            guidance_scale = 0.0
+        elif pipeline_type == "sd3":
+            guidance_scale = 3.5
+        else:
+            guidance_scale = 7.5
         
         result = pipeline(
             prompt=prompt,
@@ -854,6 +1093,30 @@ def api_system_stats():
     return jsonify(stats)
 
 
+@app.route("/api/register_model", methods=["POST"])
+def api_register_model():
+    """
+    Register a new model from repo_id or HF URL without loading it.
+    Returns the model name and updates the model list.
+    """
+    try:
+        data = request.get_json()
+        repo_or_url = data.get("repo_or_url", "").strip()
+        
+        if not repo_or_url:
+            return jsonify({"error": "Repository URL or repo_id cannot be empty"}), 400
+        
+        model_name = register_custom_model(repo_or_url)
+        
+        return jsonify({
+            "success": True,
+            "model_name": model_name,
+            "repo_id": MODEL_CONFIGS[model_name]["repo_id"],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/model_info/<model_name>", methods=["GET"])
 def api_model_info(model_name: str):
     """
@@ -889,6 +1152,61 @@ def api_model_info(model_name: str):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/hf_token", methods=["GET", "POST"])
+def api_hf_token():
+    """
+    GET: Return the current Hugging Face token (masked for security).
+    POST: Save a new Hugging Face token.
+    """
+    if request.method == "GET":
+        token = load_hf_token()
+        if token:
+            # Return masked token for display (show first 4 and last 4 characters)
+            masked_token = token[:4] + "*" * (len(token) - 8) + token[-4:] if len(token) > 8 else "****"
+            return jsonify({"token": masked_token, "has_token": True})
+        return jsonify({"token": None, "has_token": False})
+    
+    elif request.method == "POST":
+        try:
+            data = request.get_json()
+            token = data.get("token", "").strip()
+            
+            if not token:
+                return jsonify({"error": "Token cannot be empty"}), 400
+            
+            if save_hf_token(token):
+                return jsonify({"success": True, "message": "Token saved successfully"})
+            else:
+                return jsonify({"error": "Failed to save token"}), 500
+                
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/prompts", methods=["GET"])
+def api_prompts():
+    """
+    Return the list of predefined prompts from prompts.json.
+    """
+    prompts_file = BASE_DIR / "static" / "prompts.json"
+    try:
+        if prompts_file.exists():
+            with open(prompts_file, "r", encoding="utf-8") as f:
+                prompts = json.load(f)
+                return jsonify({"success": True, "prompts": prompts})
+        else:
+            return jsonify({"success": False, "error": "Prompts file not found", "prompts": []}), 404
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e), "prompts": []}), 500
+
+
 if __name__ == "__main__":
+    # Load token at startup
+    token = get_hf_token()
+    if token:
+        print("Hugging Face token loaded from config.json")
+    else:
+        print("No Hugging Face token found. Some gated models may require authentication.")
+    
     # For development only; use a proper WSGI server in production
     app.run(host="127.0.0.1", port=7860, debug=True)
