@@ -11,7 +11,7 @@ REM 1) Create virtual environment if missing
 REM ================================================================
 if not exist ".venv\Scripts\python.exe" (
     echo Creating virtual environment...
-    py -3.12 -m venv .venv
+    py -m venv .venv
 )
 
 REM ================================================================
@@ -41,7 +41,7 @@ python -m pip install ^
   flask==3.0.3 ^
   transformers>=4.47.0 ^
   psutil ^
-  pynvml ^
+  nvidia-ml-py ^
   pillow ^
   numpy ^
   requests ^

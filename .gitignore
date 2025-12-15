@@ -3,3 +3,4 @@
 /models
 /runapp2.bat
 /.venv
+/static/generated

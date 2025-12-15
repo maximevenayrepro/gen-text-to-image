@@ -8,23 +8,27 @@ from flask import (
     Flask,
     render_template,
     request,
-    send_from_directory,
     url_for,
     jsonify,
+    session,
+    Response,
 )
+import base64
+from io import BytesIO
 import torch
 from huggingface_hub import snapshot_download
-from diffusers import ZImagePipeline
+from diffusers import DiffusionPipeline, ZImagePipeline
 import psutil
 import pynvml
 
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # Required for session
 
 # Add this:
 import logging
 werkzeug_logger = logging.getLogger("werkzeug")
-werkzeug_logger.setLevel(logging.WARNING)  # ou ERROR
+werkzeug_logger.setLevel(logging.WARNING)  # or ERROR
 
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,29 +38,32 @@ IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Known models configuration
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "SDXL-Turbo": {
+        "repo_id": "stabilityai/sdxl-turbo",
+        "local_dir": MODELS_DIR / "sdxl-turbo",
+        "pipeline_type": "sdxl",
+    },
+    "SD-Turbo": {
+        "repo_id": "stabilityai/sd-turbo",
+        "local_dir": MODELS_DIR / "sd-turbo",
+        "pipeline_type": "sd",
+    },
     "Z-Image-Turbo": {
         "repo_id": "Tongyi-MAI/Z-Image-Turbo",
         "local_dir": MODELS_DIR / "Z-Image-Turbo",
-    },
-    "Flux-Schnell": {
-        "repo_id": "black-forest-labs/FLUX.1-schnell", 
-        "local_dir": MODELS_DIR / "flux-schnell"
-    },
-    "SDXL-Turbo": {
-        "repo_id": "stabilityai/sdxl-turbo", 
-        "local_dir": MODELS_DIR / "sdxl-turbo"
-    },
-    "PixArt-XL-2-1024": {
-        "repo_id": "PixArt-alpha/PixArt-XL-2-1024-MS", 
-        "local_dir": MODELS_DIR / "pixart-xl"
+        "pipeline_type": "z_image",
     }
 }
 
-DEFAULT_MODEL_NAME = "Z-Image-Turbo"
+DEFAULT_MODEL_NAME = "SDXL-Turbo"
 
 # Global pipeline state (simple cache)
-pipe: ZImagePipeline | None = None
+pipe: DiffusionPipeline | ZImagePipeline | None = None
 current_model_name: str | None = None
+
+# In-memory cache for generated images (base64)
+# Key: image_id, Value: dict with base64 and metadata
+image_cache: Dict[str, Dict[str, Any]] = {}
 
 
 # ---------------------------
@@ -89,16 +96,151 @@ def ensure_model_downloaded(repo_id: str, model_dir: Path) -> Path:
     return model_dir
 
 
-def load_pipeline(model_name: str) -> ZImagePipeline:
+def get_default_steps(pipeline) -> int | None:
     """
-    Load (or reuse) a pipeline for the given model name.
-    Uses global pipe/current_model_name to avoid reloading if not needed.
+    Extract default number of inference steps from pipeline configuration.
+    Returns int or None if not found.
+    """
+    # Check if this is a turbo model (1-4 steps recommended)
+    if hasattr(pipeline, "config") and hasattr(pipeline.config, "_name_or_path"):
+        model_path = pipeline.config._name_or_path
+        if "turbo" in str(model_path).lower() or "schnell" in str(model_path).lower():
+            return 4
+    
+    # Method 1: Check scheduler config (most reliable)
+    if hasattr(pipeline, "scheduler") and hasattr(pipeline.scheduler, "config"):
+        scheduler_config = pipeline.scheduler.config
+        # Some schedulers have num_train_timesteps which can indicate default steps
+        if hasattr(scheduler_config, "num_train_timesteps"):
+            num_train_timesteps = scheduler_config.num_train_timesteps
+            # For turbo models, default is usually 1-4 steps
+            # For regular models, default is usually 20-50 steps
+            # We can infer from the number of timesteps
+            if num_train_timesteps <= 100:
+                # Likely a turbo model, default to 4 steps
+                return 4
+            elif num_train_timesteps <= 1000:
+                # Regular model, default to 20-30 steps
+                return 20
+            else:
+                # SDXL or similar, default to 30-50 steps
+                return 50
+    
+    # Method 2: Check pipeline config
+    if hasattr(pipeline, "config"):
+        config = pipeline.config
+        if hasattr(config, "num_inference_steps"):
+            return config.num_inference_steps
+        if hasattr(config, "scheduler") and isinstance(config.scheduler, dict):
+            if "num_train_timesteps" in config.scheduler:
+                num_train_timesteps = config.scheduler["num_train_timesteps"]
+                if num_train_timesteps <= 100:
+                    return 4
+                elif num_train_timesteps <= 1000:
+                    return 20
+                else:
+                    return 50
+    
+    # Method 3: Check scheduler directly
+    if hasattr(pipeline, "scheduler"):
+        scheduler = pipeline.scheduler
+        if hasattr(scheduler, "num_train_timesteps"):
+            num_train_timesteps = scheduler.num_train_timesteps
+            if num_train_timesteps <= 100:
+                return 4
+            elif num_train_timesteps <= 1000:
+                return 20
+            else:
+                return 50
+    
+    return None
+
+
+def get_default_dimensions(pipeline) -> Dict[str, int] | None:
+    """
+    Extract default height and width from pipeline configuration.
+    Returns dict with 'height' and 'width' or None if not found.
+    """
+    # Try multiple methods to find default dimensions
+    height = None
+    width = None
+    
+    # Method 1: Check VAE config (common for most models)
+    if hasattr(pipeline, "vae") and hasattr(pipeline.vae, "config"):
+        vae_config = pipeline.vae.config
+        if hasattr(vae_config, "sample_size"):
+            size = vae_config.sample_size
+            if isinstance(size, (list, tuple)) and len(size) >= 2:
+                height, width = size[0], size[1]
+            elif isinstance(size, int):
+                height = width = size
+        elif hasattr(vae_config, "latent_size"):
+            size = vae_config.latent_size
+            if isinstance(size, (list, tuple)) and len(size) >= 2:
+                height, width = size[0], size[1]
+            elif isinstance(size, int):
+                height = width = size
+    
+    # Method 2: Check UNet config
+    if (height is None or width is None) and hasattr(pipeline, "unet") and hasattr(pipeline.unet, "config"):
+        unet_config = pipeline.unet.config
+        if hasattr(unet_config, "sample_size"):
+            size = unet_config.sample_size
+            if isinstance(size, (list, tuple)) and len(size) >= 2:
+                height, width = size[0], size[1]
+            elif isinstance(size, int):
+                height = width = size
+    
+    # Method 3: Check pipeline config directly
+    if (height is None or width is None) and hasattr(pipeline, "config"):
+        config = pipeline.config
+        if hasattr(config, "sample_size"):
+            size = config.sample_size
+            if isinstance(size, (list, tuple)) and len(size) >= 2:
+                height, width = size[0], size[1]
+            elif isinstance(size, int):
+                height = width = size
+    
+    # Method 4: Check transformer config (for Z-Image models)
+    if (height is None or width is None) and hasattr(pipeline, "transformer") and hasattr(pipeline.transformer, "config"):
+        transformer_config = pipeline.transformer.config
+        if hasattr(transformer_config, "sample_size"):
+            size = transformer_config.sample_size
+            if isinstance(size, (list, tuple)) and len(size) >= 2:
+                height, width = size[0], size[1]
+            elif isinstance(size, int):
+                height = width = size
+    
+    # Convert latent size to image size if needed (VAE typically has 8x downsampling)
+    if height and width and hasattr(pipeline, "vae") and hasattr(pipeline.vae, "config"):
+        vae_config = pipeline.vae.config
+        if hasattr(vae_config, "scaling_factor") or hasattr(vae_config, "scale_factor"):
+            # Most VAEs have 8x downsampling, so multiply by 8
+            scale_factor = getattr(vae_config, "scaling_factor", getattr(vae_config, "scale_factor", 8))
+            height = int(height * scale_factor)
+            width = int(width * scale_factor)
+    
+    # Ensure dimensions are divisible by 8 (required by diffusion models)
+    if height and width:
+        # If not divisible by 8, multiply by 8
+        if height % 8 != 0:
+            height = height * 8
+        if width % 8 != 0:
+            width = width * 8
+        return {"height": height, "width": width}
+    return None
+
+
+def load_pipeline(model_name: str) -> torch.nn.Module:
+    """
+    Load (or reuse) a pipeline for the given model.
     """
     global pipe, current_model_name
 
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model name: {model_name}")
 
+    # Reuse if already loaded
     if current_model_name == model_name and pipe is not None:
         return pipe
 
@@ -108,29 +250,54 @@ def load_pipeline(model_name: str) -> ZImagePipeline:
 
     model_path = ensure_model_downloaded(repo_id, model_dir)
 
-    # Free previous pipeline if any
+    # Release the old pipeline
     if pipe is not None:
         del pipe
         torch.cuda.empty_cache()
 
     print(f"Loading pipeline for model '{model_name}' from {model_path}")
 
-    new_pipe = ZImagePipeline.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,    # réduit la VRAM
-        local_files_only=True,
-        low_cpu_mem_usage=False,       # comme app2.py - évite les conflits
-    )
+    try:
+        # Logic: only models explicitly marked "z_image"
+        # will use ZImagePipeline. All others use DiffusionPipeline.
+        if config.get("pipeline_type", "") == "z_image":
+            new_pipe = ZImagePipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+            )
+            new_pipe.to("cuda")
+        else:
+            new_pipe = DiffusionPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+                low_cpu_mem_usage=True,
+                device_map="cuda",
+            )
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. Check your PyTorch + GPU setup.")
+        # Check for transformer component
+        if hasattr(new_pipe, "transformer"):
+            print("Transformer component is available.")
+        else:
+            print("Transformer component is missing!")
 
-    # Charge directement sur GPU (comme app2.py)
-    new_pipe.to("cuda")
+        # Log default dimensions and steps
+        default_dims = get_default_dimensions(new_pipe)
+        if default_dims:
+            print(f"Default dimensions: {default_dims['width']}x{default_dims['height']}")
+        default_steps = get_default_steps(new_pipe)
+        if default_steps:
+            print(f"Default steps: {default_steps}")
 
-    pipe = new_pipe
-    current_model_name = model_name
-    return pipe
+        pipe = new_pipe
+        current_model_name = model_name
+        return pipe
+
+    except Exception as e:
+        print(f"Error loading model pipeline for '{model_name}': {e}")
+        raise e
 
 
 def parse_repo_id_from_input(text: str) -> str:
@@ -264,6 +431,69 @@ def get_system_stats():
 
 
 # ---------------------------
+# Helper functions for default dimensions
+# ---------------------------
+
+def get_model_default_dimensions(model_name: str) -> Dict[str, int]:
+    """
+    Get default dimensions for a model.
+    Returns dict with 'height' and 'width' (exact values from model).
+    Falls back to 512x512 if not found.
+    """
+    # Check if pipeline is already loaded for this model
+    global pipe, current_model_name
+    
+    if current_model_name is not None and current_model_name == model_name and pipe is not None:
+        try:
+            dims = get_default_dimensions(pipe)
+            if dims:
+                return dims
+        except Exception as e:
+            print(f"Error getting dimensions from loaded pipeline: {e}")
+    
+    # Try to load pipeline to get dimensions (may be slow on first call)
+    try:
+        pipeline = load_pipeline(model_name)
+        dims = get_default_dimensions(pipeline)
+        if dims:
+            return dims
+    except Exception as e:
+        print(f"Could not get default dimensions for {model_name}: {e}")
+    
+    # Fallback to 512x512
+    return {"height": 512, "width": 512}
+
+
+def get_model_default_steps(model_name: str) -> int:
+    """
+    Get default number of steps for a model.
+    Returns int, or falls back to 8.
+    """
+    # Check if pipeline is already loaded for this model
+    global pipe, current_model_name
+    
+    if current_model_name is not None and current_model_name == model_name and pipe is not None:
+        try:
+            steps = get_default_steps(pipe)
+            if steps:
+                return steps
+        except Exception as e:
+            print(f"Error getting steps from loaded pipeline: {e}")
+    
+    # Try to load pipeline to get steps (may be slow on first call)
+    try:
+        pipeline = load_pipeline(model_name)
+        steps = get_default_steps(pipeline)
+        if steps:
+            return steps
+    except Exception as e:
+        print(f"Could not get default steps for {model_name}: {e}")
+    
+    # Fallback to 8
+    return 8
+
+
+# ---------------------------
 # Flask routes
 # ---------------------------
 
@@ -273,15 +503,17 @@ def index():
     Main page: show form + last generated images (none by default).
     """
     models = sorted(MODEL_CONFIGS.keys())
+    default_dims = get_model_default_dimensions(DEFAULT_MODEL_NAME)
+    default_steps = get_model_default_steps(DEFAULT_MODEL_NAME)
     return render_template(
         "index.html",
         models=models,
         selected_model=DEFAULT_MODEL_NAME,
         images=[],
         last_prompt="",
-        last_steps=8,
-        last_height=512,
-        last_width=512,
+        last_steps=default_steps,
+        last_height=default_dims["height"],
+        last_width=default_dims["width"],
         last_num_images=1,
         custom_model_repo="",
         error_message=None,
@@ -304,6 +536,14 @@ def generate_images(
 
     images_info: List[dict] = []
 
+    # Ensure dimensions are divisible by 8 (required by diffusion models)
+    height = int(height)
+    width = int(width)
+    if height % 8 != 0:
+        height = height * 8
+    if width % 8 != 0:
+        width = width * 8
+
     # Use a time-based seed if not controlled externally
     base_seed = int(time.time() * 1000) % 1_000_000_000
 
@@ -316,21 +556,38 @@ def generate_images(
             num_inference_steps=int(steps),
             guidance_scale=0.0,
             generator=generator,
-            height=int(height),
-            width=int(width),
+            height=height,
+            width=width,
         )
 
         image = result.images[0]
 
-        filename = f"{uuid.uuid4().hex}.png"
-        filepath = IMAGES_DIR / filename
-        image.save(filepath)
+        # Convert image to base64
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        image_bytes = buffer.getvalue()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_data_url = f"data:image/png;base64,{image_base64}"
+        
+        # Generate unique ID for this image
+        image_id = uuid.uuid4().hex
+        
+        # Store base64 in in-memory cache (not in session to avoid cookie size issues)
+        image_cache[image_id] = {
+            "base64": image_base64,
+            "prompt": prompt,
+            "model_name": model_name,
+            "steps": steps,
+            "height": height,
+            "width": width,
+        }
 
         images_info.append(
             {
-                "filename": filename,
-                "url": url_for("serve_generated_image", filename=filename),
-                "download_url": url_for("download_image", filename=filename),
+                "image_id": image_id,
+                "data_url": image_data_url,
+                "view_url": url_for("view_image", image_id=image_id),
+                "download_url": url_for("download_image", image_id=image_id),
                 "prompt": prompt,
                 "model_name": model_name,
                 "steps": steps,
@@ -342,10 +599,60 @@ def generate_images(
     return images_info
 
 
+@app.route("/api/generate", methods=["POST"])
+def api_generate():
+    """
+    API endpoint to generate images (returns JSON).
+    """
+    try:
+        data = request.get_json()
+        model_name = data.get("model_name", DEFAULT_MODEL_NAME)
+        custom_model_repo = data.get("custom_model_repo", "").strip()
+        prompt = data.get("prompt", "").strip()
+        num_images = int(data.get("num_images", "1"))
+
+        if custom_model_repo:
+            model_name = register_custom_model(custom_model_repo)
+
+        default_dims = get_model_default_dimensions(model_name)
+        default_steps = get_model_default_steps(model_name)
+        steps = int(data.get("steps", str(default_steps)))
+        height = int(data.get("height", str(default_dims["height"])))
+        width = int(data.get("width", str(default_dims["width"])))
+
+        if not prompt:
+            return jsonify({"error": "Prompt cannot be empty."}), 400
+
+        images_info = generate_images(
+            prompt=prompt,
+            steps=steps,
+            height=height,
+            width=width,
+            num_images=num_images,
+            model_name=model_name,
+        )
+
+        return jsonify({
+            "success": True,
+            "images": images_info,
+            "model_name": model_name,
+            "prompt": prompt,
+            "steps": steps,
+            "height": height,
+            "width": width,
+            "num_images": num_images,
+        })
+
+    except Exception as e:
+        error_message = str(e)
+        print(f"Error during generation: {error_message}")
+        return jsonify({"error": error_message}), 500
+
+
 @app.route("/generate", methods=["POST"])
 def generate():
     """
-    Handle form submission to generate images.
+    Handle form submission to generate images (legacy support).
     """
     error_message = None
 
@@ -354,14 +661,18 @@ def generate():
         custom_model_repo = request.form.get("custom_model_repo", "").strip()
         prompt = request.form.get("prompt", "").strip()
 
-        steps = int(request.form.get("steps", "8"))
-        height = int(request.form.get("height", "512"))
-        width = int(request.form.get("width", "512"))
         num_images = int(request.form.get("num_images", "1"))
 
         if custom_model_repo:
             # If a custom repo is given, register and use it
             model_name = register_custom_model(custom_model_repo)
+
+        # Get default values for the selected model
+        default_dims = get_model_default_dimensions(model_name)
+        default_steps = get_model_default_steps(model_name)
+        steps = int(request.form.get("steps", str(default_steps)))
+        height = int(request.form.get("height", str(default_dims["height"])))
+        width = int(request.form.get("width", str(default_dims["width"])))
 
         if not prompt:
             raise ValueError("Prompt cannot be empty.")
@@ -395,35 +706,102 @@ def generate():
         print(f"Error during generation: {error_message}")
 
         models = sorted(MODEL_CONFIGS.keys())
+        default_dims = get_model_default_dimensions(DEFAULT_MODEL_NAME)
+        default_steps = get_model_default_steps(DEFAULT_MODEL_NAME)
         return render_template(
             "index.html",
             models=models,
             selected_model=DEFAULT_MODEL_NAME,
             images=[],
             last_prompt="",
-            last_steps=8,
-            last_height=512,
-            last_width=512,
+            last_steps=default_steps,
+            last_height=default_dims["height"],
+            last_width=default_dims["width"],
             last_num_images=1,
             custom_model_repo="",
             error_message=error_message,
         )
 
 
-@app.route("/static/generated/<path:filename>")
-def serve_generated_image(filename: str):
+@app.route("/view/<image_id>")
+def view_image(image_id: str):
     """
-    Serve generated images from disk.
+    Display image base64 in a new tab as HTML page.
     """
-    return send_from_directory(IMAGES_DIR, filename)
+    if image_id not in image_cache:
+        return "Image not found", 404
+    
+    image_data = image_cache[image_id]
+    base64_data = image_data["base64"]
+    image_data_url = f"data:image/png;base64,{base64_data}"
+    
+    # Return HTML page with the image
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Generated Image</title>
+        <style>
+            body {{
+                margin: 0;
+                padding: 20px;
+                background: #0f172a;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+            }}
+            img {{
+                max-width: 100%;
+                max-height: 100vh;
+                object-fit: contain;
+                border-radius: 8px;
+                box-shadow: 0 20px 45px rgba(15, 23, 42, 0.9);
+            }}
+        </style>
+    </head>
+    <body>
+        <img src="{image_data_url}" alt="Generated image">
+    </body>
+    </html>
+    """
+    return html
 
 
-@app.route("/download/<path:filename>")
-def download_image(filename: str):
+@app.route("/download/<image_id>")
+def download_image(image_id: str):
     """
-    Force image download to disk.
+    Convert base64 image to PNG and save to disk, then download it.
     """
-    return send_from_directory(IMAGES_DIR, filename, as_attachment=True)
+    if image_id not in image_cache:
+        return "Image not found", 404
+    
+    image_data = image_cache[image_id]
+    base64_data = image_data["base64"]
+    
+    # Decode base64 to bytes
+    image_bytes = base64.b64decode(base64_data)
+    
+    # Generate filename
+    filename = f"{image_id}.png"
+    filepath = IMAGES_DIR / filename
+    
+    # Save to disk
+    with open(filepath, "wb") as f:
+        f.write(image_bytes)
+    
+    # Clean up cache after download (optional - keeps memory usage down)
+    # Uncomment if you want to remove images from cache after download:
+    # del image_cache[image_id]
+    
+    # Return as download
+    return Response(
+        image_bytes,
+        mimetype="image/png",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+    )
 
 
 @app.route("/api/system_stats", methods=["GET"])
@@ -433,6 +811,41 @@ def api_system_stats():
     """
     stats = get_system_stats()
     return jsonify(stats)
+
+
+@app.route("/api/model_info/<model_name>", methods=["GET"])
+def api_model_info(model_name: str):
+    """
+    Return model information including default dimensions and steps.
+    """
+    try:
+        if model_name not in MODEL_CONFIGS:
+            return jsonify({"error": f"Unknown model: {model_name}"}), 404
+        
+        # Load pipeline to get dimensions and steps
+        pipeline = load_pipeline(model_name)
+        default_dims = get_default_dimensions(pipeline)
+        default_steps = get_default_steps(pipeline)
+        
+        info = {
+            "model_name": model_name,
+            "repo_id": MODEL_CONFIGS[model_name]["repo_id"],
+        }
+        
+        if default_dims:
+            info["default_dimensions"] = default_dims
+        else:
+            info["default_dimensions"] = None
+            info["note"] = "Could not determine default dimensions from model config"
+        
+        if default_steps:
+            info["default_steps"] = default_steps
+        else:
+            info["default_steps"] = 8  # Fallback
+        
+        return jsonify(info)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

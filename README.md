@@ -19,7 +19,7 @@ A Flask-based web application for generating images locally using Hugging Face d
 ## Installation
 
 ```bash
-pip install flask torch diffusers huggingface_hub psutil pynvml
+pip install flask torch diffusers huggingface_hub psutil nvidia-ml-py
 ```
 
 ## Usage
