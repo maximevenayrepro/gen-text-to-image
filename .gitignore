@@ -5,4 +5,4 @@
 /.venv
 /static/generated
 /config.json
-/.cursor/debug.log
+.cursor/debug.log

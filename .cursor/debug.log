@@ -4957,3 +4957,8 @@
 {"location":"app.js:renderSystemStats","message":"renderSystemStats called","data":{"hasData":true},"timestamp":1765824193426,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
 {"location":"app.js:renderSystemStats","message":"Container check","data":{"containerExists":true},"timestamp":1765824193426,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
 {"location":"app.js:renderSystemStats","message":"Chart elements check after update","data":{"cpuChartExists":true,"ramChartExists":true,"cpuChartInstance":true,"ramChartInstance":true},"timestamp":1765824193430,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
+{"location":"app.js:fetchSystemStats","message":"fetchSystemStats called","data":{"timestamp":1765824253088},"timestamp":1765824253088,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
+{"location":"app.js:fetchSystemStats","message":"Stats data received","data":{"hasData":true,"hasCpuRam":true,"hasGpus":true},"timestamp":1765824253196,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
+{"location":"app.js:renderSystemStats","message":"renderSystemStats called","data":{"hasData":true},"timestamp":1765824253196,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
+{"location":"app.js:renderSystemStats","message":"Container check","data":{"containerExists":true},"timestamp":1765824253196,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
+{"location":"app.js:renderSystemStats","message":"Chart elements check after update","data":{"cpuChartExists":true,"ramChartExists":true,"cpuChartInstance":true,"ramChartInstance":true},"timestamp":1765824253200,"sessionId":"debug-session","runId":"post-fix","hypothesisId":"H1"}
