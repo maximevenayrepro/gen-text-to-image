@@ -37,50 +37,7 @@ MODELS_DIR = BASE_DIR / "models"
 IMAGES_DIR = BASE_DIR / "static" / "generated"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = BASE_DIR / "config.json"
-
-# Known models configuration
-MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
-    "SDXL-Turbo": {
-        "repo_id": "stabilityai/sdxl-turbo",
-        "local_dir": MODELS_DIR / "sdxl-turbo",
-        "pipeline_type": "sdxl",
-        "default_steps": 4,
-        "default_height": 512,
-        "default_width": 512,
-    },
-    "SDXL": {
-        "repo_id": "stabilityai/stable-diffusion-xl-base-1.0",
-        "local_dir": MODELS_DIR / "sdxl-base",
-        "pipeline_type": "sdxl",
-        "default_steps": 25,
-        "default_height": 1024,
-        "default_width": 1024,
-    },
-    "SD-Turbo": {
-        "repo_id": "stabilityai/sd-turbo",
-        "local_dir": MODELS_DIR / "sd-turbo",
-        "pipeline_type": "sd",
-        "default_steps": 4,
-        "default_height": 512,
-        "default_width": 512,
-    },
-    "Z-Image-Turbo": {
-        "repo_id": "Tongyi-MAI/Z-Image-Turbo",
-        "local_dir": MODELS_DIR / "Z-Image-Turbo",
-        "pipeline_type": "z_image",
-        "default_steps": 8,
-        "default_height": 512,
-        "default_width": 512,
-    },
-    "stable-diffusion-3.5-large": {
-        "repo_id": "stabilityai/stable-diffusion-3.5-large",
-        "local_dir": MODELS_DIR / "stable-diffusion-3.5-large",
-        "pipeline_type": "sd3",
-        "default_steps": 28,
-        "default_height": 1024,
-        "default_width": 1024,
-    }
-}
+MODELS_CONFIG_FILE = MODELS_DIR / "models.json"
 
 DEFAULT_MODEL_NAME = "SDXL"
 
@@ -161,6 +118,222 @@ def get_hf_token() -> Optional[str]:
         os.environ["HUGGING_FACE_HUB_TOKEN"] = token
     
     return token
+
+
+# ---------------------------
+# Models configuration management (based on folders)
+# ---------------------------
+
+def load_models_config() -> Dict[str, Dict[str, Any]]:
+    """
+    Load models configuration from models.json file.
+    Returns a dictionary with model configurations.
+    """
+    if not MODELS_CONFIG_FILE.exists():
+        return {}
+    
+    try:
+        with open(MODELS_CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            # Convert local_dir strings back to Path objects
+            for model_name, model_config in config.items():
+                if "local_dir" in model_config and isinstance(model_config["local_dir"], str):
+                    model_config["local_dir"] = Path(model_config["local_dir"])
+            return config
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Error loading models.json: {e}")
+        return {}
+
+
+def save_models_config(config: Dict[str, Dict[str, Any]]) -> bool:
+    """
+    Save models configuration to models.json file.
+    Converts Path objects to strings for JSON serialization.
+    """
+    try:
+        # Create a copy with Path objects converted to strings
+        config_to_save = {}
+        for model_name, model_config in config.items():
+            config_to_save[model_name] = model_config.copy()
+            if "local_dir" in config_to_save[model_name] and isinstance(config_to_save[model_name]["local_dir"], Path):
+                config_to_save[model_name]["local_dir"] = str(config_to_save[model_name]["local_dir"])
+        
+        with open(MODELS_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_to_save, f, indent=2, ensure_ascii=False)
+        return True
+    except IOError as e:
+        print(f"Error saving models.json: {e}")
+        return False
+
+
+def sync_models_with_folders() -> None:
+    """
+    Synchronize models.json with actual folders in models directory.
+    Removes models from JSON that no longer exist as folders.
+    """
+    config = load_models_config()
+    updated = False
+    
+    # Get list of actual folders in models directory
+    existing_folders = set()
+    if MODELS_DIR.exists():
+        for item in MODELS_DIR.iterdir():
+            if item.is_dir() and not item.name.startswith("."):
+                # Only include folders that contain model_index.json (valid models)
+                if (item / "model_index.json").exists():
+                    existing_folders.add(item.name)
+    
+    # Remove models from config that don't exist as folders
+    # The model_name in JSON should match the folder name
+    models_to_remove = []
+    for model_name in config.keys():
+        # Check if folder exists with this name
+        if model_name not in existing_folders:
+            # Also check if local_dir points to a folder that exists
+            model_dir = config[model_name].get("local_dir")
+            folder_name = None
+            if isinstance(model_dir, Path):
+                folder_name = model_dir.name
+            elif isinstance(model_dir, str):
+                folder_name = Path(model_dir).name
+            
+            # If the folder from local_dir also doesn't exist, remove the model
+            if folder_name and folder_name not in existing_folders:
+                models_to_remove.append(model_name)
+                updated = True
+            elif not folder_name:
+                # If we can't determine folder name, check if model_name folder exists
+                if model_name not in existing_folders:
+                    models_to_remove.append(model_name)
+                    updated = True
+    
+    for model_name in models_to_remove:
+        del config[model_name]
+        print(f"Removed model '{model_name}' from config (folder no longer exists)")
+    
+    if updated:
+        save_models_config(config)
+
+
+def get_available_models() -> List[str]:
+    """
+    Get list of available models based on folders in models directory.
+    """
+    if not MODELS_DIR.exists():
+        return []
+    
+    models = []
+    for item in MODELS_DIR.iterdir():
+        if item.is_dir() and not item.name.startswith("."):
+            # Check if folder contains model_index.json (indicates a valid model)
+            if (item / "model_index.json").exists():
+                models.append(item.name)
+    
+    return sorted(models)
+
+
+def get_model_config(model_name: str) -> Dict[str, Any]:
+    """
+    Get model configuration. If model doesn't exist in config but folder exists,
+    create a default configuration entry.
+    """
+    config = load_models_config()
+    
+    # Check if model exists in config
+    if model_name in config:
+        return config[model_name]
+    
+    # Check if folder exists
+    model_dir = MODELS_DIR / model_name
+    if not model_dir.exists() or not model_dir.is_dir():
+        raise ValueError(f"Model folder '{model_name}' does not exist")
+    
+    # Create default configuration for unknown model
+    default_config = {
+        "repo_id": "unknown",
+        "local_dir": model_dir,
+        "pipeline_type": "unknown",
+        "default_steps": 4,
+        "default_height": 512,
+        "default_width": 512,
+    }
+    
+    # Save to config
+    config[model_name] = default_config
+    save_models_config(config)
+    
+    print(f"Created default config for model '{model_name}'")
+    return default_config
+
+
+def update_model_config(model_name: str, updates: Dict[str, Any]) -> bool:
+    """
+    Update model configuration with provided values.
+    """
+    config = load_models_config()
+    
+    if model_name not in config:
+        # Create entry if it doesn't exist
+        model_dir = MODELS_DIR / model_name
+        config[model_name] = {
+            "repo_id": updates.get("repo_id", "unknown"),
+            "local_dir": model_dir,
+            "pipeline_type": updates.get("pipeline_type", "unknown"),
+            "default_steps": updates.get("default_steps", 4),
+            "default_height": updates.get("default_height", 512),
+            "default_width": updates.get("default_width", 512),
+        }
+    else:
+        # Update existing entry
+        config[model_name].update(updates)
+    
+    return save_models_config(config)
+
+
+def detect_pipeline_type(pipeline) -> str:
+    """
+    Detect pipeline type from loaded pipeline object.
+    Returns: "z_image", "sd3", "sdxl", or "sd"
+    """
+    # Check pipeline class type first (most reliable)
+    if isinstance(pipeline, ZImagePipeline):
+        # Verify it's actually Z-Image by checking transformer type
+        if hasattr(pipeline, "transformer"):
+            transformer_type = type(pipeline.transformer).__name__
+            if "SD3" in transformer_type:
+                return "sd3"  # Was incorrectly loaded as Z-Image
+            elif "ZImage" in transformer_type:
+                return "z_image"
+        return "z_image"
+    elif isinstance(pipeline, StableDiffusion3Pipeline):
+        return "sd3"
+    elif isinstance(pipeline, DiffusionPipeline):
+        # Check for SD3 by transformer type (most reliable indicator)
+        if hasattr(pipeline, "transformer"):
+            transformer_type = type(pipeline.transformer).__name__
+            if "SD3" in transformer_type:
+                return "sd3"
+            elif "ZImage" in transformer_type:
+                return "z_image"
+        # Check for SD3 by text_encoder_3
+        if hasattr(pipeline, "text_encoder_3"):
+            return "sd3"
+        # Try to detect SDXL vs regular SD
+        # SDXL typically has text_encoder_2
+        if hasattr(pipeline, "text_encoder_2"):
+            return "sdxl"
+        else:
+            return "sd"
+    
+    # Fallback: check for specific components
+    if hasattr(pipeline, "transformer"):
+        transformer_type = type(pipeline.transformer).__name__
+        if "SD3" in transformer_type:
+            return "sd3"
+        elif "ZImage" in transformer_type:
+            return "z_image"
+    
+    return "sd"  # Default fallback
 
 
 # ---------------------------
@@ -339,18 +512,23 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
     """
     global pipe, current_model_name
 
-    if model_name not in MODEL_CONFIGS:
-        raise ValueError(f"Unknown model name: {model_name}")
+    # Get model config (creates default if needed)
+    config = get_model_config(model_name)
+    repo_id = config["repo_id"]
+    model_dir = config["local_dir"]
 
     # Reuse if already loaded
     if current_model_name == model_name and pipe is not None:
         return pipe
 
-    config = MODEL_CONFIGS[model_name]
-    repo_id = config["repo_id"]
-    model_dir = config["local_dir"]
-
-    model_path = ensure_model_downloaded(repo_id, model_dir)
+    # Download model if repo_id is not "unknown"
+    if repo_id != "unknown":
+        model_path = ensure_model_downloaded(repo_id, model_dir)
+    else:
+        # Use local folder directly
+        model_path = model_dir
+        if not (model_path / "model_index.json").exists():
+            raise ValueError(f"Model folder '{model_name}' does not contain a valid model")
 
     # Release the old pipeline
     if pipe is not None:
@@ -365,7 +543,14 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
         token_kwargs = {"token": token} if token else {}
         
         # Logic: use specific pipeline types based on model configuration
-        pipeline_type = config.get("pipeline_type", "")
+        pipeline_type = config.get("pipeline_type", "unknown")
+        detected_type = None
+        
+        # If model name suggests SD3 but type is z_image, force re-detection
+        if pipeline_type == "z_image" and ("stable-diffusion-3" in model_name.lower() or "sd3" in model_name.lower()):
+            print(f"Model '{model_name}' has type 'z_image' but name suggests SD3. Forcing re-detection...")
+            pipeline_type = "unknown"
+        
         if pipeline_type == "z_image":
             new_pipe = ZImagePipeline.from_pretrained(
                 model_path,
@@ -375,6 +560,11 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
                 **token_kwargs,
             )
             new_pipe.to("cuda")
+            # Verify it's actually Z-Image by checking transformer type
+            actual_type = detect_pipeline_type(new_pipe)
+            if actual_type != "z_image":
+                print(f"Warning: Model '{model_name}' was configured as z_image but is actually {actual_type}. Correcting...")
+                detected_type = actual_type
         elif pipeline_type == "sd3":
             new_pipe = StableDiffusion3Pipeline.from_pretrained(
                 model_path,
@@ -384,6 +574,97 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
                 **token_kwargs,
             )
             new_pipe.to("cuda")
+            # Verify it's actually SD3
+            actual_type = detect_pipeline_type(new_pipe)
+            if actual_type != "sd3":
+                print(f"Warning: Model '{model_name}' was configured as sd3 but is actually {actual_type}. Correcting...")
+                detected_type = actual_type
+        elif pipeline_type == "unknown":
+            # Try to auto-detect pipeline type
+            # Check model_index.json first to get hints
+            model_index_path = model_path / "model_index.json"
+            pipeline_class = ""
+            if model_index_path.exists():
+                try:
+                    with open(model_index_path, "r") as f:
+                        model_index = json.load(f)
+                        pipeline_class = model_index.get("_class_name", "").lower()
+                except Exception:
+                    pass
+            
+            # Try SD3 first if model name or class suggests it (more specific)
+            if "stable-diffusion-3" in model_name.lower() or "sd3" in pipeline_class:
+                try:
+                    new_pipe = StableDiffusion3Pipeline.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16,
+                        local_files_only=True,
+                        low_cpu_mem_usage=True,
+                        **token_kwargs,
+                    )
+                    new_pipe.to("cuda")
+                    detected_type = "sd3"
+                except Exception as e:
+                    print(f"Failed to load as SD3: {e}")
+                    # Fall through to try Z-Image
+                    try:
+                        new_pipe = ZImagePipeline.from_pretrained(
+                            model_path,
+                            torch_dtype=torch.bfloat16,
+                            local_files_only=True,
+                            low_cpu_mem_usage=True,
+                            **token_kwargs,
+                        )
+                        new_pipe.to("cuda")
+                        # Verify it's actually Z-Image by checking transformer
+                        detected_type = detect_pipeline_type(new_pipe)
+                    except Exception:
+                        # Fallback to regular DiffusionPipeline
+                        new_pipe = DiffusionPipeline.from_pretrained(
+                            model_path,
+                            torch_dtype=torch.bfloat16,
+                            local_files_only=True,
+                            low_cpu_mem_usage=True,
+                            device_map="cuda",
+                            **token_kwargs,
+                        )
+                        detected_type = detect_pipeline_type(new_pipe)
+            else:
+                # Try Z-Image first for other models
+                try:
+                    new_pipe = ZImagePipeline.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16,
+                        local_files_only=True,
+                        low_cpu_mem_usage=True,
+                        **token_kwargs,
+                    )
+                    new_pipe.to("cuda")
+                    # Verify it's actually Z-Image by checking transformer
+                    detected_type = detect_pipeline_type(new_pipe)
+                except Exception:
+                    try:
+                        # Try SD3
+                        new_pipe = StableDiffusion3Pipeline.from_pretrained(
+                            model_path,
+                            torch_dtype=torch.bfloat16,
+                            local_files_only=True,
+                            low_cpu_mem_usage=True,
+                            **token_kwargs,
+                        )
+                        new_pipe.to("cuda")
+                        detected_type = "sd3"
+                    except Exception:
+                        # Fallback to regular DiffusionPipeline
+                        new_pipe = DiffusionPipeline.from_pretrained(
+                            model_path,
+                            torch_dtype=torch.bfloat16,
+                            local_files_only=True,
+                            low_cpu_mem_usage=True,
+                            device_map="cuda",
+                            **token_kwargs,
+                        )
+                        detected_type = detect_pipeline_type(new_pipe)
         else:
             new_pipe = DiffusionPipeline.from_pretrained(
                 model_path,
@@ -393,6 +674,11 @@ def load_pipeline(model_name: str) -> torch.nn.Module:
                 device_map="cuda",
                 **token_kwargs,
             )
+
+        # Update pipeline_type if it was unknown and we detected it, or if it was incorrect
+        if detected_type:
+            update_model_config(model_name, {"pipeline_type": detected_type})
+            print(f"Detected and updated pipeline_type to '{detected_type}' for model '{model_name}'")
 
         # Check for transformer component
         if hasattr(new_pipe, "transformer"):
@@ -446,12 +732,21 @@ def register_custom_model(repo_or_url: str) -> str:
     repo_id = parse_repo_id_from_input(repo_or_url)
     model_name = repo_id.split("/")[-1]
 
-    if model_name not in MODEL_CONFIGS:
+    # Check if model already exists in config
+    config = load_models_config()
+    if model_name not in config:
         model_dir = MODELS_DIR / model_name
-        MODEL_CONFIGS[model_name] = {
+        # Create default config for new model
+        new_config = {
             "repo_id": repo_id,
             "local_dir": model_dir,
+            "pipeline_type": "unknown",
+            "default_steps": 4,
+            "default_height": 512,
+            "default_width": 512,
         }
+        config[model_name] = new_config
+        save_models_config(config)
         print(f"Registered new model '{model_name}' with repo_id '{repo_id}'.")
 
     return model_name
@@ -687,17 +982,18 @@ def get_system_stats():
 def get_model_default_dimensions(model_name: str) -> Dict[str, int]:
     """
     Get default dimensions for a model.
-    First checks MODEL_CONFIGS, then tries to get from pipeline.
+    First checks config, then tries to get from pipeline.
     Falls back to 512x512 if not found.
     """
-    # First, check if model has default dimensions in config
-    if model_name in MODEL_CONFIGS:
-        config = MODEL_CONFIGS[model_name]
+    try:
+        config = get_model_config(model_name)
         if "default_height" in config and "default_width" in config:
             return {
                 "height": config["default_height"],
                 "width": config["default_width"],
             }
+    except Exception as e:
+        print(f"Error getting model config for {model_name}: {e}")
     
     # Check if pipeline is already loaded for this model
     global pipe, current_model_name
@@ -726,14 +1022,15 @@ def get_model_default_dimensions(model_name: str) -> Dict[str, int]:
 def get_model_default_steps(model_name: str) -> int:
     """
     Get default number of steps for a model.
-    First checks MODEL_CONFIGS, then tries to get from pipeline.
+    First checks config, then tries to get from pipeline.
     Falls back to 4 if not found.
     """
-    # First, check if model has default steps in config
-    if model_name in MODEL_CONFIGS:
-        config = MODEL_CONFIGS[model_name]
+    try:
+        config = get_model_config(model_name)
         if "default_steps" in config:
             return config["default_steps"]
+    except Exception as e:
+        print(f"Error getting model config for {model_name}: {e}")
     
     # Check if pipeline is already loaded for this model
     global pipe, current_model_name
@@ -768,13 +1065,21 @@ def index():
     """
     Main page: show form + last generated images (none by default).
     """
-    models = sorted(MODEL_CONFIGS.keys())
-    default_dims = get_model_default_dimensions(DEFAULT_MODEL_NAME)
-    default_steps = get_model_default_steps(DEFAULT_MODEL_NAME)
+    models = get_available_models()
+    if not models:
+        models = [DEFAULT_MODEL_NAME] if DEFAULT_MODEL_NAME in get_available_models() else []
+    
+    # Use first available model or default
+    selected_model = models[0] if models else DEFAULT_MODEL_NAME
+    if DEFAULT_MODEL_NAME in models:
+        selected_model = DEFAULT_MODEL_NAME
+    
+    default_dims = get_model_default_dimensions(selected_model)
+    default_steps = get_model_default_steps(selected_model)
     return render_template(
         "index.html",
         models=models,
-        selected_model=DEFAULT_MODEL_NAME,
+        selected_model=selected_model,
         images=[],
         last_prompt="",
         last_steps=default_steps,
@@ -819,7 +1124,7 @@ def generate_images(
 
         # Determine guidance scale based on model type
         # Turbo models use 0.0, SD3 models use 3.5, regular models use 7.5-9.0
-        config = MODEL_CONFIGS.get(model_name, {})
+        config = get_model_config(model_name)
         pipeline_type = config.get("pipeline_type", "")
         repo_id = config.get("repo_id", "").lower()
         is_turbo = "turbo" in model_name.lower() or "turbo" in repo_id
@@ -831,14 +1136,106 @@ def generate_images(
         else:
             guidance_scale = 7.5
         
-        result = pipeline(
-            prompt=prompt,
-            num_inference_steps=int(steps),
-            guidance_scale=guidance_scale,
-            generator=generator,
-            height=height,
-            width=width,
-        )
+        # For SD3, we need to handle prompt differently to avoid chat_template error
+        if pipeline_type == "sd3":
+            # Check if tokenizer has chat_template
+            has_chat_template = (
+                hasattr(pipeline, "tokenizer") and 
+                pipeline.tokenizer is not None and 
+                hasattr(pipeline.tokenizer, "chat_template") and 
+                pipeline.tokenizer.chat_template is not None
+            )
+            
+            # Try to use encode_prompt if available to bypass chat_template
+            use_encode_prompt = hasattr(pipeline, "encode_prompt") and not has_chat_template
+            
+            try:
+                if use_encode_prompt:
+                    # Use encode_prompt to get prompt_embeds directly
+                    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+                        prompt=prompt,
+                        prompt_2=None,
+                        device="cuda",
+                        num_images_per_prompt=1,
+                        do_classifier_free_guidance=guidance_scale > 1.0,
+                        negative_prompt=None,
+                        negative_prompt_2=None,
+                    )
+                    result = pipeline(
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=negative_prompt_embeds,
+                        num_inference_steps=int(steps),
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        height=height,
+                        width=width,
+                    )
+                else:
+                    # Try with prompt directly first
+                    result = pipeline(
+                        prompt=prompt,
+                        num_inference_steps=int(steps),
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        height=height,
+                        width=width,
+                    )
+            except Exception as e:
+                if "chat_template" in str(e) or not has_chat_template:
+                    # Try with encode_prompt if not already tried
+                    if not use_encode_prompt and hasattr(pipeline, "encode_prompt"):
+                        try:
+                            prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+                                prompt=prompt,
+                                prompt_2=None,
+                                device="cuda",
+                                num_images_per_prompt=1,
+                                do_classifier_free_guidance=guidance_scale > 1.0,
+                                negative_prompt=None,
+                                negative_prompt_2=None,
+                            )
+                            result = pipeline(
+                                prompt_embeds=prompt_embeds,
+                                negative_prompt_embeds=negative_prompt_embeds,
+                                num_inference_steps=int(steps),
+                                guidance_scale=guidance_scale,
+                                generator=generator,
+                                height=height,
+                                width=width,
+                            )
+                        except Exception:
+                            # Fallback: try with prompt_2=prompt
+                            result = pipeline(
+                                prompt=prompt,
+                                prompt_2=prompt,
+                                num_inference_steps=int(steps),
+                                guidance_scale=guidance_scale,
+                                generator=generator,
+                                height=height,
+                                width=width,
+                            )
+                    else:
+                        # Try with prompt_2=prompt (SD3 often uses dual prompts)
+                        result = pipeline(
+                            prompt=prompt,
+                            prompt_2=prompt,
+                            num_inference_steps=int(steps),
+                            guidance_scale=guidance_scale,
+                            generator=generator,
+                            height=height,
+                            width=width,
+                        )
+                else:
+                    raise
+        else:
+            result = pipeline(
+                prompt=prompt,
+                num_inference_steps=int(steps),
+                guidance_scale=guidance_scale,
+                generator=generator,
+                height=height,
+                width=width,
+            )
 
         image = result.images[0]
 
@@ -903,6 +1300,19 @@ def api_generate():
         if not prompt:
             return jsonify({"error": "Prompt cannot be empty."}), 400
 
+        # Update model defaults if they differ from current defaults
+        config = get_model_config(model_name)
+        updates = {}
+        if steps != config.get("default_steps", default_steps):
+            updates["default_steps"] = steps
+        if height != config.get("default_height", default_dims["height"]):
+            updates["default_height"] = height
+        if width != config.get("default_width", default_dims["width"]):
+            updates["default_width"] = width
+        
+        if updates:
+            update_model_config(model_name, updates)
+
         images_info = generate_images(
             prompt=prompt,
             steps=steps,
@@ -966,7 +1376,7 @@ def generate():
             model_name=model_name,
         )
 
-        models = sorted(MODEL_CONFIGS.keys())
+        models = get_available_models()
         return render_template(
             "index.html",
             models=models,
@@ -985,7 +1395,7 @@ def generate():
         error_message = str(e)
         print(f"Error during generation: {error_message}")
 
-        models = sorted(MODEL_CONFIGS.keys())
+        models = get_available_models()
         default_dims = get_model_default_dimensions(DEFAULT_MODEL_NAME)
         default_steps = get_model_default_steps(DEFAULT_MODEL_NAME)
         return render_template(
@@ -1107,11 +1517,12 @@ def api_register_model():
             return jsonify({"error": "Repository URL or repo_id cannot be empty"}), 400
         
         model_name = register_custom_model(repo_or_url)
+        config = get_model_config(model_name)
         
         return jsonify({
             "success": True,
             "model_name": model_name,
-            "repo_id": MODEL_CONFIGS[model_name]["repo_id"],
+            "repo_id": config["repo_id"],
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1123,8 +1534,7 @@ def api_model_info(model_name: str):
     Return model information including default dimensions and steps.
     """
     try:
-        if model_name not in MODEL_CONFIGS:
-            return jsonify({"error": f"Unknown model: {model_name}"}), 404
+        config = get_model_config(model_name)
         
         # Load pipeline to get dimensions and steps
         pipeline = load_pipeline(model_name)
@@ -1133,7 +1543,7 @@ def api_model_info(model_name: str):
         
         info = {
             "model_name": model_name,
-            "repo_id": MODEL_CONFIGS[model_name]["repo_id"],
+            "repo_id": config["repo_id"],
         }
         
         if default_dims:
@@ -1200,7 +1610,46 @@ def api_prompts():
         return jsonify({"success": False, "error": str(e), "prompts": []}), 500
 
 
+@app.route("/api/update_model_defaults", methods=["POST"])
+def api_update_model_defaults():
+    """
+    Update default steps, width, and height for a model.
+    """
+    try:
+        data = request.get_json()
+        model_name = data.get("model_name", "").strip()
+        
+        if not model_name:
+            return jsonify({"error": "Model name cannot be empty"}), 400
+        
+        updates = {}
+        if "default_steps" in data:
+            updates["default_steps"] = int(data["default_steps"])
+        if "default_width" in data:
+            updates["default_width"] = int(data["default_width"])
+        if "default_height" in data:
+            updates["default_height"] = int(data["default_height"])
+        
+        if not updates:
+            return jsonify({"error": "No updates provided"}), 400
+        
+        if update_model_config(model_name, updates):
+            return jsonify({
+                "success": True,
+                "message": f"Updated defaults for model '{model_name}'",
+                "updates": updates
+            })
+        else:
+            return jsonify({"error": "Failed to update model config"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
+    # Synchronize models.json with actual folders at startup
+    print("Synchronizing models configuration with folders...")
+    sync_models_with_folders()
+    
     # Load token at startup
     token = get_hf_token()
     if token:
