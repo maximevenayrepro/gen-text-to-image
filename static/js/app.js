@@ -294,9 +294,10 @@ function renderSystemStats(data) {
             updateChart(charts.gpuMem[gpuKey], history.gpuMem[gpuKey], labels);
         }
 
-        // GPU Shared Memory chart (using mem_util_percent like GPU Memory)
-        const gpuSharedMemPercent = gpu.mem_util_percent ?? 0;
-        addToHistory(history.gpuSharedMem[gpuKey], gpuSharedMemPercent, MAX_HISTORY);
+        // GPU Shared Memory chart (using system RAM as shared memory is system RAM)
+        // Shared memory GPU is typically system RAM shared with GPU
+        const ramPercent = cpuRam.ram_percent ?? 0;
+        addToHistory(history.gpuSharedMem[gpuKey], ramPercent, MAX_HISTORY);
         ensureGPUContainer(gpuIndex, "shared");
         
         const sharedLabelEl = document.getElementById(gpuKey + "-shared-label");
@@ -306,9 +307,9 @@ function renderSystemStats(data) {
             sharedLabelEl.textContent = "GPU " + gpuIndex + " Shared Mem";
         }
         if (sharedValueEl) {
-            const memUsed = gpu.mem_used_MB ?? 0;
-            const memTotal = gpu.mem_total_MB ?? 0;
-            sharedValueEl.textContent = gpuSharedMemPercent.toFixed(0) + "% (" + memUsed.toFixed(0) + "/" + memTotal.toFixed(0) + " MB)";
+            const ramUsed = cpuRam.ram_used_GB ?? 0;
+            const ramTotal = cpuRam.ram_total_GB ?? 0;
+            sharedValueEl.textContent = ramPercent.toFixed(0) + "% (" + ramUsed.toFixed(1) + "/" + ramTotal.toFixed(1) + " GB)";
         }
 
         if (!charts.gpuSharedMem[gpuKey]) {
@@ -527,45 +528,7 @@ fetchSystemStats();
 setInterval(fetchSystemStats, 3000);
 
 // ----- Update dimensions and steps when model changes -----
-document.addEventListener("DOMContentLoaded", function () {
-    const modelSelect = document.getElementById("model_name");
-    const heightInput = document.getElementById("height");
-    const widthInput = document.getElementById("width");
-    const stepsInput = document.getElementById("steps");
-
-    if (!modelSelect || !heightInput || !widthInput || !stepsInput) {
-        return;
-    }
-
-    async function updateDefaultsForModel(modelName) {
-        try {
-            const response = await fetch(`/api/model_info/${encodeURIComponent(modelName)}`);
-            if (!response.ok) {
-                throw new Error("Network response was not ok");
-            }
-            const data = await response.json();
-            
-            if (data.default_dimensions) {
-                heightInput.value = data.default_dimensions.height;
-                widthInput.value = data.default_dimensions.width;
-            }
-            
-            if (data.default_steps) {
-                stepsInput.value = data.default_steps;
-            }
-        } catch (e) {
-            console.error("Failed to fetch model defaults:", e);
-            // Keep current values on error
-        }
-    }
-
-    modelSelect.addEventListener("change", function () {
-        const selectedModel = modelSelect.value;
-        if (selectedModel) {
-            updateDefaultsForModel(selectedModel);
-        }
-    });
-});
+// Removed: no longer fetches model defaults, uses fixed values (4, 512, 512)
 
 // Function to display generated images
 function displayGeneratedImages(images) {

@@ -42,20 +42,37 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
         "repo_id": "stabilityai/sdxl-turbo",
         "local_dir": MODELS_DIR / "sdxl-turbo",
         "pipeline_type": "sdxl",
+        "default_steps": 4,
+        "default_height": 512,
+        "default_width": 512,
+    },
+    "SDXL": {
+        "repo_id": "stabilityai/stable-diffusion-xl-base-1.0",
+        "local_dir": MODELS_DIR / "sdxl-base",
+        "pipeline_type": "sdxl",
+        "default_steps": 25,
+        "default_height": 1024,
+        "default_width": 1024,
     },
     "SD-Turbo": {
         "repo_id": "stabilityai/sd-turbo",
         "local_dir": MODELS_DIR / "sd-turbo",
         "pipeline_type": "sd",
+        "default_steps": 4,
+        "default_height": 512,
+        "default_width": 512,
     },
     "Z-Image-Turbo": {
         "repo_id": "Tongyi-MAI/Z-Image-Turbo",
         "local_dir": MODELS_DIR / "Z-Image-Turbo",
         "pipeline_type": "z_image",
+        "default_steps": 8,
+        "default_height": 512,
+        "default_width": 512,
     }
 }
 
-DEFAULT_MODEL_NAME = "SDXL-Turbo"
+DEFAULT_MODEL_NAME = "SDXL"
 
 # Global pipeline state (simple cache)
 pipe: DiffusionPipeline | ZImagePipeline | None = None
@@ -437,9 +454,18 @@ def get_system_stats():
 def get_model_default_dimensions(model_name: str) -> Dict[str, int]:
     """
     Get default dimensions for a model.
-    Returns dict with 'height' and 'width' (exact values from model).
+    First checks MODEL_CONFIGS, then tries to get from pipeline.
     Falls back to 512x512 if not found.
     """
+    # First, check if model has default dimensions in config
+    if model_name in MODEL_CONFIGS:
+        config = MODEL_CONFIGS[model_name]
+        if "default_height" in config and "default_width" in config:
+            return {
+                "height": config["default_height"],
+                "width": config["default_width"],
+            }
+    
     # Check if pipeline is already loaded for this model
     global pipe, current_model_name
     
@@ -467,8 +493,15 @@ def get_model_default_dimensions(model_name: str) -> Dict[str, int]:
 def get_model_default_steps(model_name: str) -> int:
     """
     Get default number of steps for a model.
-    Returns int, or falls back to 8.
+    First checks MODEL_CONFIGS, then tries to get from pipeline.
+    Falls back to 4 if not found.
     """
+    # First, check if model has default steps in config
+    if model_name in MODEL_CONFIGS:
+        config = MODEL_CONFIGS[model_name]
+        if "default_steps" in config:
+            return config["default_steps"]
+    
     # Check if pipeline is already loaded for this model
     global pipe, current_model_name
     
@@ -489,8 +522,8 @@ def get_model_default_steps(model_name: str) -> int:
     except Exception as e:
         print(f"Could not get default steps for {model_name}: {e}")
     
-    # Fallback to 8
-    return 8
+    # Fallback to 4
+    return 4
 
 
 # ---------------------------
@@ -551,10 +584,18 @@ def generate_images(
         image_seed = base_seed + i
         generator = torch.Generator("cuda").manual_seed(image_seed)
 
+        # Determine guidance scale based on model type
+        # Turbo models use 0.0, regular models use 7.5-9.0
+        config = MODEL_CONFIGS.get(model_name, {})
+        repo_id = config.get("repo_id", "").lower()
+        is_turbo = "turbo" in model_name.lower() or "turbo" in repo_id
+        
+        guidance_scale = 0.0 if is_turbo else 7.5
+        
         result = pipeline(
             prompt=prompt,
             num_inference_steps=int(steps),
-            guidance_scale=0.0,
+            guidance_scale=guidance_scale,
             generator=generator,
             height=height,
             width=width,
